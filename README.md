@@ -4,12 +4,17 @@ Script todo-en-uno ([sniper_canje.py](sniper_canje.py)) para detectar en tiempo 
 
 ---
 
-## ⚡ Cómo funciona
+## ⚡ Características Principales
 
-1. **Cero calibración:** Localiza automáticamente en vivo dónde está la casilla *"Escribe el código de 25 caracteres"* y los botones **SIGUIENTE** y **CONFIRMAR** de Xbox usando cajas delimitadoras (`bounding_rect`) del motor OCR nativo de Windows.
-2. **Auto-instalable:** La primera vez que lo ejecutas, instala automáticamente sus únicas dependencias (`mss` y `winocr`).
-3. **Inyección por hardware (`SendInput`):** Hace clic y escribe los 25 caracteres directamente a nivel de kernel de Windows (`< 1 ms` por tecla) sin depender del portapapeles.
-4. **Filtro inteligente del alfabeto de Xbox:** Ignora enlaces web y texto normal, y corrige confusiones ópticas del OCR basándose en el alfabeto oficial sin vocales de Microsoft (`BCDFGHJKMPQRTVWXYZ2346789`).
+1. **Soporte Multi-Monitor en caliente (1, 2 o 3 pantallas):**
+   - Vigila simultáneamente hasta **3 monitores conectados** con *Frame-Diffing* independiente por pantalla (solo escanea el monitor donde cambian los píxeles).
+   - Puedes tener el directo/video o WhatsApp en el **Monitor 1** y la página de canje de Xbox en el **Monitor 2 o 3** (incluso con coordenadas negativas o monitores en distinta posición).
+   - Usa coordenadas de Escritorio Virtual de Windows (`MOUSEEVENTF_VIRTUALDESK` + `SM_XVIRTUALSCREEN`) y activación automática de ventana (`WindowFromPoint` + `SetForegroundWindow`).
+2. **Adaptable a todas las resoluciones (720p, 768p, 900p, 1080p, 1200p, 1440p/2K y 4K UHD):**
+   - Escala automáticamente pantallas 4K/Ultrawide para mantener alta velocidad de escaneo y aplica **Auto-Zoom 2x/3x BICUBIC** en líneas pequeñas (720p/768p o burbujas de chat).
+   - Soporta escalas de zoom de Windows (100%, 125%, 150%, 175%, 200%) con *Per-Monitor DPI Awareness v2*.
+3. **Cero calibración:** Localiza automáticamente en vivo dónde está la casilla *"Escribe el código de 25 caracteres"* y los botones **SIGUIENTE** y **CONFIRMAR** de Xbox.
+4. **Inyección instantánea Win32 (`SetClipboardData` + `SendInput`):** Copia al portapapeles de kernel en `< 0.5 ms`, enfoca la ventana de Xbox, pega los 25 caracteres de golpe (`Ctrl+V`) y confirma.
 
 ---
 

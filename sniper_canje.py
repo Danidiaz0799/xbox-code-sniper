@@ -8,7 +8,9 @@ import sys
 import time
 import winsound
 
-# Auto-instalador automático en el primer arranque (solo necesitas este único archivo)
+# ==============================================================================
+# 0. AUTO-INSTALADOR DE DEPENDENCIAS (Archivo único 100% autónomo)
+# ==============================================================================
 try:
     import mss
     import mss.windows.gdi as mss_gdi
@@ -19,8 +21,10 @@ try:
     from winrt.windows.media.ocr import OcrEngine
     from winrt.windows.storage.streams import DataWriter
 except ImportError:
-    print("[⚙] Instalando librerías necesarias por única vez...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "mss", "pillow", "pyperclip", "winocr"])
+    print("[⚙] Instalando librerías necesarias por única vez (mss, pillow, pyperclip, winocr)...")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "mss", "pillow", "pyperclip", "winocr"]
+    )
     import mss
     import mss.windows.gdi as mss_gdi
     from PIL import Image
@@ -30,13 +34,13 @@ except ImportError:
     from winrt.windows.media.ocr import OcrEngine
     from winrt.windows.storage.streams import DataWriter
 
-# Evita bloqueo "BitBlt: Acceso denegado" cuando la ventana de Xbox está abierta
+# Desactiva CAPTUREBLT para evitar "BitBlt: Acceso denegado" con la App/Web de Xbox en Windows 11
 mss_gdi.CAPTUREBLT = 0
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
-# Precisión DPI para que las coordenadas coincidan en cualquier pantalla (100%, 125%, 150%)
+# Activar Per-Monitor DPI Awareness v2 para precisión exacta en escalas 100%, 125%, 150%, 175%, 200%
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -46,15 +50,36 @@ except Exception:
         pass
 
 # ==============================================================================
-# 1. CLIC Y PEGADO NATIVO WIN32 (< 1 ms)
+# 1. MOTOR NATIVO WIN32 MULTI-MONITOR (VIRTUAL DESKTOP + PORTAPAPELES KERNEL)
 # ==============================================================================
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+GMEM_MOVEABLE = 0x0002
+CF_UNICODETEXT = 13
+
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+user32.SetClipboardData.restype = wintypes.HANDLE
+
+# Métricas de escritorio virtual multi-monitor de Windows
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SM_CMONITORS = 80
+GA_ROOT = 2
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_VIRTUALDESK = 0x4000
 MOUSEEVENTF_ABSOLUTE = 0x8000
 KEYEVENTF_KEYUP = 0x0002
 
@@ -123,39 +148,85 @@ def _enviar_inputs(*eventos: INPUT) -> int:
     return user32.SendInput(len(eventos), ctypes.byref(arr), ctypes.sizeof(INPUT))
 
 
-def clic_nativo(x: int, y: int) -> int:
-    screen_w = max(user32.GetSystemMetrics(0), 1920)
-    screen_h = max(user32.GetSystemMetrics(1), 1200)
-    abs_x = int(int(x) * 65535 / (screen_w - 1))
-    abs_y = int(int(y) * 65535 / (screen_h - 1))
+def copiar_portapapeles_win32(texto: str):
+    """Copia el código al portapapeles de Windows en < 0.5 ms usando memoria global Win32."""
+    data = (texto + "\0").encode("utf-16-le")
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            try:
+                user32.EmptyClipboard()
+                h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                if h_mem:
+                    ptr = kernel32.GlobalLock(h_mem)
+                    if ptr:
+                        ctypes.memmove(ptr, data, len(data))
+                        kernel32.GlobalUnlock(h_mem)
+                        if user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+                            return
+            finally:
+                user32.CloseClipboard()
+        time.sleep(0.0005)
+    try:
+        pyperclip.copy(texto)
+    except Exception:
+        pass
+
+
+def enfocar_ventana_en_punto(x: int, y: int):
+    """Trae al frente la ventana ubicada en (x, y) aunque el usuario esté usando otro monitor."""
+    try:
+        pt = wintypes.POINT(int(x), int(y))
+        hwnd = user32.WindowFromPoint(pt)
+        if hwnd:
+            root_hwnd = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+            user32.SetForegroundWindow(root_hwnd)
+    except Exception:
+        pass
+
+
+def clic_multimonitor(x: int, y: int) -> int:
+    """
+    Mueve el cursor y hace clic con precisión exacta en configuraciones de 1, 2 o 3 monitores
+    (soporta coordenadas negativas y resoluciones mixtas 720p / 1080p / 1440p / 4K).
+    """
+    vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    vw = max(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN), 1920)
+    vh = max(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN), 1080)
+
+    abs_x = int(((int(x) - vx) * 65535) / max(vw - 1, 1))
+    abs_y = int(((int(y) - vy) * 65535) / max(vh - 1, 1))
 
     user32.SetCursorPos(int(x), int(y))
 
+    base_flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
     move = INPUT(type=INPUT_MOUSE)
-    move.union.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, 0)
+    move.union.mi = MOUSEINPUT(abs_x, abs_y, 0, base_flags, 0, 0)
     down = INPUT(type=INPUT_MOUSE)
-    down.union.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN, 0, 0)
+    down.union.mi = MOUSEINPUT(abs_x, abs_y, 0, base_flags | MOUSEEVENTF_LEFTDOWN, 0, 0)
     up = INPUT(type=INPUT_MOUSE)
-    up.union.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP, 0, 0)
+    up.union.mi = MOUSEINPUT(abs_x, abs_y, 0, base_flags | MOUSEEVENTF_LEFTUP, 0, 0)
 
     return _enviar_inputs(move, down, up)
 
 
-def escribir_codigo_directo(coord, codigo_25: str) -> int:
+def inyectar_codigo_en_xbox(coord, codigo_25: str) -> int:
+    """
+    1. Copia los 25 caracteres al portapapeles de Windows en < 0.5 ms.
+    2. Activa la ventana destino (aunque esté en otro monitor) y hace doble clic rápido en la casilla.
+    3. Limpia cualquier texto residual (Ctrl+A + Backspace), pega de golpe (Ctrl+V) y presiona Enter.
+    """
     if not coord:
         return 0
 
-    try:
-        pyperclip.copy(codigo_25.upper())
-    except Exception:
-        pass
+    copiar_portapapeles_win32(codigo_25.upper())
+    enfocar_ventana_en_punto(coord[0], coord[1])
 
-    clic_nativo(coord[0], coord[1])
-    time.sleep(0.025)
-    clic_nativo(coord[0], coord[1])
-    time.sleep(0.025)
+    clic_multimonitor(coord[0], coord[1])
+    time.sleep(0.018)
+    clic_multimonitor(coord[0], coord[1])
+    time.sleep(0.018)
 
-    # Seleccionar todo (Ctrl+A), borrar (Backspace), pegar de golpe (Ctrl+V) y presionar Enter
     enviados = _enviar_inputs(
         _key_event(VK_CONTROL, False),
         _key_event(VK_A, False),
@@ -178,7 +249,7 @@ def presionar_enter_nativo():
 
 
 # ==============================================================================
-# 2. MOTOR OCR NATIVO DE WINDOWS CON COORDENADAS Y AUTO-ZOOM 2X EN LÍNEAS
+# 2. MOTOR OCR NATIVO DE WINDOWS ADAPTATIVO (SOPORTA DESDE 720P HASTA 4K UHD)
 # ==============================================================================
 class FastWindowsOCR:
     def __init__(self, lang_tag: str = "es"):
@@ -207,19 +278,39 @@ class FastWindowsOCR:
         res = self.loop.run_until_complete(self._recognize_async(bgra_bytes, width, height))
         return res.text.strip() if res and res.text else ""
 
-    def recognize_with_boxes(self, bgra_bytes: bytes, width: int, height: int, offset_x: int = 0, offset_y: int = 0):
-        res = self.loop.run_until_complete(self._recognize_async(bgra_bytes, width, height))
+    def recognize_monitor(self, bgra_bytes: bytes, width: int, height: int, offset_x: int = 0, offset_y: int = 0):
+        """
+        Escanea un monitor adaptándose automáticamente a su resolución (720p, 1080p, 1440p, Ultrawide, 4K).
+        Si la resolución supera 2560px de ancho (ej. 4K 3840x2160), reescala 0.5x para máxima fluidez
+        y proyecta las coordenadas de vuelta al tamaño nativo real del monitor.
+        """
+        escala = 1.0
+        ocr_bytes = bgra_bytes
+        ocr_w, ocr_h = width, height
+
+        if width > 2600 or height > 1600:
+            escala = 0.5
+            ocr_w = max(1, width // 2)
+            ocr_h = max(1, height // 2)
+            img = Image.frombytes("RGBA", (width, height), bgra_bytes)
+            img_small = img.resize((ocr_w, ocr_h), Image.Resampling.BILINEAR)
+            ocr_bytes = img_small.tobytes()
+
+        res = self.loop.run_until_complete(self._recognize_async(ocr_bytes, ocr_w, ocr_h))
         if not res:
             return []
+
+        inv = 1.0 / escala
         lineas = []
         for line in res.lines:
             words = line.words
             if not words:
                 continue
-            x0 = min(w.bounding_rect.x for w in words)
-            y0 = min(w.bounding_rect.y for w in words)
-            x1 = max(w.bounding_rect.x + w.bounding_rect.width for w in words)
-            y1 = max(w.bounding_rect.y + w.bounding_rect.height for w in words)
+            x0 = min(w.bounding_rect.x for w in words) * inv
+            y0 = min(w.bounding_rect.y for w in words) * inv
+            x1 = max(w.bounding_rect.x + w.bounding_rect.width for w in words) * inv
+            y1 = max(w.bounding_rect.y + w.bounding_rect.height for w in words) * inv
+
             lineas.append({
                 "text": line.text.strip(),
                 "cx": int(offset_x + (x0 + x1) / 2),
@@ -230,32 +321,48 @@ class FastWindowsOCR:
                 "ry": int(y0),
                 "w": int(x1 - x0),
                 "h": int(y1 - y0),
+                "mon_w": width,
+                "mon_h": height,
             })
         return lineas
 
 
 # ==============================================================================
-# 3. INTELIGENCIA DE CÓDIGOS XBOX + AUTO-ZOOM 2X EN BURBUJAS DE CHAT/VIDEO
+# 3. VALIDADOR DE FORMATO PERFECTO XBOX (5x5) + AUTO-ZOOM 2X EN TIEMPO REAL
 # ==============================================================================
+# Alfabeto oficial de Xbox (Microsoft): 18 consonantes + 7 dígitos (NUNCA usa A, E, I, O, U, L, N, S, 0, 1, 5)
 XBOX_VALID_CHARS = set("BCDFGHJKMPQRTVWXYZ2346789")
+
 TABLA_CORRECCION_XBOX = str.maketrans({
-    "0": "Q", "O": "D", "1": "7", "I": "J", "L": "T",
-    "5": "6", "S": "9", "A": "4", "E": "F", "U": "V", "N": "M",
+    "0": "Q",
+    "O": "D",
+    "1": "7",
+    "I": "J",
+    "L": "T",
+    "5": "6",
+    "S": "9",
+    "A": "4",
+    "E": "F",
+    "U": "V",
+    "N": "M",
 })
 
-# Soporta códigos 5x5 incluso si el borde de la burbuja de WhatsApp pegó 1 carácter extra al inicio/final
+# Patrón 5x5: 5 bloques de 5 caracteres (tolera 1 carácter extra en los extremos por bordes de burbujas de chat)
 PATRON_XBOX_5X5 = re.compile(
     r"([A-Z0-9]{5,6})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5,6})",
     re.IGNORECASE,
 )
 
-# Detecta si una línea parece un código parcial (ej. '*9P4X-7M2W8-R5X9Y-H3Q6V-J8N26') para hacerle Zoom 2x
+# Detecta si una línea contiene bloques de código con 1 carácter borroso (ej. '*9P4X-7M2W8-...') para aplicar Zoom 2x
 PATRON_SOSPECHA_CODIGO = re.compile(
-    r"[A-Z0-9*#]{3,6}[\s\-–—._]+[A-Z0-9]{5}[\s\-–—._]+[A-Z0-9]{5}",
+    r"[A-Z0-9*#$!¡?¿]{3,6}[\s\-–—._]+[A-Z0-9]{5}[\s\-–—._]+[A-Z0-9]{5}",
     re.IGNORECASE,
 )
 
-RE_PLACEHOLDER_INPUT = re.compile(r"(escrib[ea]\s+el\s+c\S*digo\s+de\s+25|enter\s+.*25-character)", re.IGNORECASE)
+RE_PLACEHOLDER_INPUT = re.compile(
+    r"(escrib[ea]\s+el\s+c\S*digo\s+de\s+25|enter\s+.*25-character)",
+    re.IGNORECASE,
+)
 RE_COMO_ESTE_BAJO_INPUT = re.compile(r"^(como\s+este|like\s+this)\s*:", re.IGNORECASE)
 RE_ETIQUETA_ARRIBA_INPUT = re.compile(r"^se\s+agregar\S*\s+a\s+\S+@", re.IGNORECASE)
 RE_BOTON_SIGUIENTE = re.compile(r"^(siguiente|sibuien\S*|siguien\S*|next)$", re.IGNORECASE)
@@ -264,32 +371,47 @@ RE_BOTON_CONFIRMAR = re.compile(r"^(confirmar|confirm|canjear\s+ahora|redeem\s+n
 
 
 def _validar_codigo_25(raw25: str, tiene_guiones: bool):
+    """
+    Valida que los 25 caracteres correspondan a un código de 25 caracteres (formato 5x5):
+    - Rechaza texto común, palabras, frases o placeholders ('XXXXXXXXXXXXXXXXXXXXXXXXX').
+    - Devuelve (codigo_25, codigo_formateado_5x5, es_100_puro_xbox).
+    """
     raw25 = raw25.upper()
-    if len(raw25) != 25 or not raw25.isalnum() or raw25 == "X" * 25:
+    if len(raw25) != 25 or not raw25.isalnum() or len(set(raw25)) <= 3:
         return None
 
     digit_count = sum(1 for c in raw25 if c.isdigit())
+    alpha_count = sum(1 for c in raw25 if c.isalpha())
     valid_xbox_count = sum(1 for c in raw25 if c in XBOX_VALID_CHARS)
 
-    if tiene_guiones and digit_count >= 3:
-        return raw25, "-".join(raw25[i : i + 5] for i in range(0, 25, 5))
+    if digit_count < 2 or alpha_count < 5:
+        return None
 
-    if valid_xbox_count >= 21 and digit_count >= 2:
+    es_puro = valid_xbox_count == 25
+
+    # Si viene con guiones explícitos 5x5, verificar que al menos 3 bloques tengan números
+    if tiene_guiones and digit_count >= 3:
+        bloques = [raw25[i : i + 5] for i in range(0, 25, 5)]
+        bloques_con_digito = sum(1 for b in bloques if any(c.isdigit() for c in b))
+        if bloques_con_digito >= 3:
+            return raw25, "-".join(bloques), valid_xbox_count
+
+    # Si no tenía todos los guiones pero cumple el alfabeto sin vocales de Xbox
+    if valid_xbox_count >= 21 and digit_count >= 3:
         corregido = raw25.translate(TABLA_CORRECCION_XBOX)
-        return corregido, "-".join(corregido[i : i + 5] for i in range(0, 25, 5))
+        return corregido, "-".join(corregido[i : i + 5] for i in range(0, 25, 5)), valid_xbox_count
 
     return None
 
 
 def _extraer_de_texto_linea(txt: str):
     txt = txt.upper()
-    if any(m in txt for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK")):
+    if any(m in txt for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK", "@")):
         return []
 
     resultados = []
     for m in PATRON_XBOX_5X5.finditer(txt):
         g1, g2, g3, g4, g5 = m.groups()
-        # Si el primer o último bloque tiene 6 caracteres por un borde de burbuja ('OK9P4X'), recortar a 5
         if len(g1) == 6:
             g1 = g1[-5:]
         if len(g5) == 6:
@@ -338,27 +460,42 @@ def detectar_codigos_en_lineas(lineas, casilla_xbox_coord=None, ocr=None, frame_
     for item in lineas:
         txt = item["text"]
         cx, cy = item["cx"], item["cy"]
+        mon_w = item.get("mon_w", 1920)
+        mon_h = item.get("mon_h", 1080)
 
-        if casilla_xbox_coord and abs(cx - casilla_xbox_coord[0]) < 240 and abs(cy - casilla_xbox_coord[1]) < 42:
-            continue
+        # Ignorar el texto que ya está escrito dentro de la propia casilla de Xbox (proporcional a la resolución)
+        if casilla_xbox_coord:
+            tol_x = max(220, int(mon_w * 0.14))
+            tol_y = max(38, int(mon_h * 0.04))
+            if abs(cx - casilla_xbox_coord[0]) < tol_x and abs(cy - casilla_xbox_coord[1]) < tol_y:
+                continue
 
         extraidos = _extraer_de_texto_linea(txt)
+        necesita_zoom = (
+            not extraidos
+            or (item["h"] < 20 and any(score < 25 for _, _, score in extraidos))
+        )
 
-        # Si la línea parece un código pero a 1x el OCR falló en 1 letra (ej: '*9P4X-7M2W8-...'),
-        # hacemos un recorte + Zoom 2x BICUBIC instantáneo (~1.5 ms) sobre esa línea
-        if not extraidos and ocr and frame_bgra and PATRON_SOSPECHA_CODIGO.search(txt):
-            rx = max(0, item.get("rx", item["x"]) - 10)
-            ry = max(0, item.get("ry", item["y"]) - 8)
-            rw = min(fw - rx, item["w"] + 20)
-            rh = min(fh - ry, item["h"] + 16)
+        # Auto-Zoom 2x/3x BICUBIC sobre la línea cuando 1x falló o el texto es pequeño y tiene algún carácter dudoso
+        if necesita_zoom and ocr and frame_bgra and (extraidos or PATRON_SOSPECHA_CODIGO.search(txt)):
+            pad_x = max(12, int(item["h"] * 0.8))
+            pad_y = max(8, int(item["h"] * 0.6))
+            rx = max(0, item["rx"] - pad_x)
+            ry = max(0, item["ry"] - pad_y)
+            rw = min(fw - rx, item["w"] + pad_x * 2)
+            rh = min(fh - ry, item["h"] + pad_y * 2)
             if rw > 20 and rh > 8:
                 img_full = Image.frombytes("RGBA", (fw, fh), frame_bgra)
                 crop = img_full.crop((rx, ry, rx + rw, ry + rh))
-                crop2x = crop.resize((rw * 2, rh * 2), Image.Resampling.BICUBIC)
-                txt_zoom = ocr.recognize_text(crop2x.tobytes(), rw * 2, rh * 2)
-                extraidos = _extraer_de_texto_linea(txt_zoom)
+                factor = 3 if item["h"] < 15 else 2
+                crop_zoom = crop.resize((rw * factor, rh * factor), Image.Resampling.BICUBIC)
+                txt_zoom = ocr.recognize_text(crop_zoom.tobytes(), rw * factor, rh * factor)
+                extraidos_zoom = _extraer_de_texto_linea(txt_zoom)
+                if extraidos_zoom:
+                    if not extraidos or extraidos_zoom[0][2] > extraidos[0][2]:
+                        extraidos = extraidos_zoom
 
-        for c25, cfmt in extraidos:
+        for c25, cfmt, _ in extraidos:
             if c25 not in vistos:
                 vistos.add(c25)
                 encontrados.append((c25, cfmt, (cx, cy)))
@@ -367,6 +504,10 @@ def detectar_codigos_en_lineas(lineas, casilla_xbox_coord=None, ocr=None, frame_
 
 
 def localizar_ui_xbox_dinamica(lineas):
+    """
+    Localiza dinámicamente la casilla de Xbox y los botones SIGUIENTE y CONFIRMAR
+    adaptando las distancias proporcionalmente al tamaño de fuente/resolución de cualquier pantalla.
+    """
     coord_input = None
     coord_siguiente = None
     coord_confirmar = None
@@ -380,14 +521,18 @@ def localizar_ui_xbox_dinamica(lineas):
     if not coord_input:
         for item in lineas:
             if RE_COMO_ESTE_BAJO_INPUT.search(item["text"]):
-                coord_input = (item["x"] + 150, item["y"] - 48)
+                offset_y = max(32, int(item["h"] * 3.8))
+                offset_x = max(80, int(item["w"] * 0.5))
+                coord_input = (item["x"] + offset_x, item["y"] - offset_y)
                 break
             if RE_ETIQUETA_ARRIBA_INPUT.search(item["text"]):
-                coord_input = (item["x"] + 150, item["y"] + item["h"] + 42)
+                offset_y = max(28, int(item["h"] * 3.2))
+                offset_x = max(80, int(item["w"] * 0.45))
+                coord_input = (item["x"] + offset_x, item["y"] + item["h"] + offset_y)
 
     for item in lineas:
         limpio = re.sub(r"[^A-Za-zÁÉÍÓÚáéíóúñÑ\s]", "", item["text"]).strip()
-        if not limpio or item["w"] > 400 or item["h"] > 100:
+        if not limpio or item["w"] > max(420, int(item.get("mon_w", 1920) * 0.25)) or item["h"] > 140:
             continue
         if RE_BOTON_CONFIRMAR.match(limpio):
             coord_confirmar = (item["cx"], item["cy"])
@@ -397,98 +542,154 @@ def localizar_ui_xbox_dinamica(lineas):
             linea_cancelar = item
 
     if not coord_siguiente and linea_cancelar:
-        coord_siguiente = (linea_cancelar["cx"] + int(linea_cancelar["w"] * 3.8), linea_cancelar["cy"])
+        coord_siguiente = (
+            linea_cancelar["cx"] + int(linea_cancelar["w"] * 3.8),
+            linea_cancelar["cy"],
+        )
 
     return coord_input, coord_siguiente, coord_confirmar
 
 
 # ==============================================================================
-# 4. BUCLE PRINCIPAL (UN SOLO ARCHIVO, 100% AUTOMÁTICO)
+# 4. BUCLE MULTI-MONITOR (1, 2 O 3 MONITORES EN TIEMPO REAL)
 # ==============================================================================
+def obtener_monitores_activos(sct, max_monitores: int = 3):
+    """Devuelve hasta 3 monitores físicos conectados (excluyendo el índice 0 virtual combinado)."""
+    todos = sct.monitors[1 : max_monitores + 1]
+    return list(enumerate(todos, start=1))
+
+
 def main():
-    print("=" * 72)
-    print("  🚀 SNIPER XBOX 100% DINÁMICO (ARCHIVO ÚNICO - AUTO-ZOOM 2X)")
-    print("=" * 72)
-    print("  1. Pon en pantalla dividida el directo/WhatsApp y xbox.com/redeem.")
-    print("  2. El bot localiza solo la casilla de Xbox y escribe el código al instante.")
-    print("=" * 72)
+    print("=" * 78)
+    print("  🚀 SNIPER XBOX PRO (MULTI-MONITOR 1-3 PANTALLAS | 720P A 4K | AUTO-ZOOM)")
+    print("=" * 78)
 
     ocr = FastWindowsOCR(lang_tag="es")
-    ocr.recognize_with_boxes(bytes(64 * 64 * 4), 64, 64)
+    ocr.recognize_text(bytes(64 * 64 * 4), 64, 64)
+    copiar_portapapeles_win32("")
 
     sct = mss.MSS()
-    monitor = sct.monitors[1]
+    monitores = obtener_monitores_activos(sct, max_monitores=3)
+    num_monitores_prev = len(monitores)
+
+    print(f"  • Monitores detectados ({num_monitores_prev}):")
+    for idx, m in monitores:
+        print(f"    - Monitor {idx}: {m['width']}x{m['height']} en (X={m['left']}, Y={m['top']})")
+    print("  • Puedes tener el video/WhatsApp en un monitor y Xbox en otro, o en pantalla dividida.")
+    print("=" * 78)
+
     codigos_procesados = set()
     ultima_coord_xbox = None
     ultimo_btn_siguiente = None
-    ultimo_raw = None
+    monitor_xbox_idx = 1
+    ultimo_raw_por_monitor = {}
 
-    print("[✔] Vigilando pantalla en vivo...\n")
+    # Escaneo inicial en todos los monitores para localizar la ventana de Xbox e ignorar códigos viejos
+    for idx, mon in monitores:
+        try:
+            s_init = sct.grab(mon)
+            lin_init = ocr.recognize_monitor(s_init.raw, s_init.width, s_init.height, mon["left"], mon["top"])
+            inp_i, sig_i, _ = localizar_ui_xbox_dinamica(lin_init)
+            if inp_i:
+                ultima_coord_xbox = inp_i
+                ultimo_btn_siguiente = sig_i
+                monitor_xbox_idx = idx
+                print(f"[🎯 CASILLA XBOX LISTA EN MONITOR {idx}] Posición: {ultima_coord_xbox} | Siguiente: {ultimo_btn_siguiente}")
+        except Exception:
+            pass
+
+    print("[✔] Vigilando todos tus monitores en tiempo real...\n")
 
     while True:
         try:
-            s = sct.grab(monitor)
-            if s.raw == ultimo_raw:
-                time.sleep(0.005)
-                continue
-            ultimo_raw = s.raw
-            t_frame = time.perf_counter()
+            # Detectar en caliente si se conectó o desconectó un monitor (hasta 3 máx)
+            n_actual = min(user32.GetSystemMetrics(SM_CMONITORS), 3)
+            if n_actual != num_monitores_prev:
+                try:
+                    sct.close()
+                except Exception:
+                    pass
+                sct = mss.MSS()
+                monitores = obtener_monitores_activos(sct, max_monitores=3)
+                num_monitores_prev = len(monitores)
+                ultimo_raw_por_monitor.clear()
+                print(f"[🔄] Configuración de pantallas actualizada: {num_monitores_prev} monitor(es) activos.")
 
-            lineas = ocr.recognize_with_boxes(s.raw, s.width, s.height, monitor["left"], monitor["top"])
-            dyn_input, dyn_sig, _ = localizar_ui_xbox_dinamica(lineas)
+            for idx, mon in monitores:
+                s = sct.grab(mon)
+                if ultimo_raw_por_monitor.get(idx) == s.raw:
+                    continue
 
-            if dyn_input:
-                if not ultima_coord_xbox or (
-                    abs(dyn_input[0] - ultima_coord_xbox[0]) > 12 or abs(dyn_input[1] - ultima_coord_xbox[1]) > 12
-                ):
-                    print(f"[🎯 CASILLA XBOX LOCALIZADA] Posición: {dyn_input} | Botón Siguiente: {dyn_sig}")
-                ultima_coord_xbox = dyn_input
-            if dyn_sig:
-                ultimo_btn_siguiente = dyn_sig
+                ultimo_raw_por_monitor[idx] = s.raw
+                t_frame = time.perf_counter()
 
-            codigos = detectar_codigos_en_lineas(
-                lineas,
-                casilla_xbox_coord=ultima_coord_xbox,
-                ocr=ocr,
-                frame_bgra=s.raw,
-                fw=s.width,
-                fh=s.height,
-            )
-            for c25, cfmt, pos_codigo in reversed(codigos):
-                if c25 not in codigos_procesados and ultima_coord_xbox:
-                    codigos_procesados.add(c25)
-                    n_ev = escribir_codigo_directo(ultima_coord_xbox, c25)
-                    ms = (time.perf_counter() - t_frame) * 1000.0
-                    print(f"\n⚡ [CÓDIGO DETECTADO EN {pos_codigo} -> CANJEADO EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}")
+                lineas = ocr.recognize_monitor(s.raw, s.width, s.height, mon["left"], mon["top"])
+                dyn_input, dyn_sig, _ = localizar_ui_xbox_dinamica(lineas)
 
-                    # Vigilar y pulsar SIGUIENTE y CONFIRMAR automáticamente
-                    for _ in range(20):
-                        time.sleep(0.14)
-                        s2 = sct.grab(monitor)
-                        lin2 = ocr.recognize_with_boxes(s2.raw, s2.width, s2.height, monitor["left"], monitor["top"])
-                        _, sig2, conf2 = localizar_ui_xbox_dinamica(lin2)
-                        if conf2:
-                            clic_nativo(conf2[0], conf2[1])
-                            presionar_enter_nativo()
-                            print(f"   [✔ AUTO-CONFIRMAR] Botón 'CONFIRMAR' pulsado en {conf2}!")
-                            break
-                        target_sig = sig2 or ultimo_btn_siguiente
-                        if target_sig:
-                            clic_nativo(target_sig[0], target_sig[1])
+                if dyn_input:
+                    if not ultima_coord_xbox or (
+                        abs(dyn_input[0] - ultima_coord_xbox[0]) > 14 or abs(dyn_input[1] - ultima_coord_xbox[1]) > 14
+                    ):
+                        print(f"[🎯 CASILLA XBOX EN MONITOR {idx}] Posición: {dyn_input} | Botón Siguiente: {dyn_sig}")
+                    ultima_coord_xbox = dyn_input
+                    monitor_xbox_idx = idx
+                if dyn_sig and monitor_xbox_idx == idx:
+                    ultimo_btn_siguiente = dyn_sig
 
-                    try:
-                        winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                    except Exception:
-                        pass
-                    ultimo_raw = None
-                    break
+                codigos = detectar_codigos_en_lineas(
+                    lineas,
+                    casilla_xbox_coord=ultima_coord_xbox if monitor_xbox_idx == idx else None,
+                    ocr=ocr,
+                    frame_bgra=s.raw,
+                    fw=s.width,
+                    fh=s.height,
+                )
 
-            time.sleep(0.005)
+                for c25, cfmt, pos_codigo in reversed(codigos):
+                    if c25 not in codigos_procesados:
+                        if not ultima_coord_xbox:
+                            print(f"[!] Código {cfmt} visto en Monitor {idx} {pos_codigo}, pero no se ve la casilla de Xbox en ningún monitor.")
+                            continue
+
+                        codigos_procesados.add(c25)
+                        n_ev = inyectar_codigo_en_xbox(ultima_coord_xbox, c25)
+                        ms = (time.perf_counter() - t_frame) * 1000.0
+                        print(
+                            f"\n⚡ [MONITOR {idx} -> MONITOR {monitor_xbox_idx} EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}"
+                        )
+
+                        # Fase rápida de confirmación escaneando únicamente el monitor donde está Xbox
+                        mon_xbox = dict(monitores).get(monitor_xbox_idx, mon)
+                        for _ in range(22):
+                            time.sleep(0.12)
+                            s2 = sct.grab(mon_xbox)
+                            lin2 = ocr.recognize_monitor(
+                                s2.raw, s2.width, s2.height, mon_xbox["left"], mon_xbox["top"]
+                            )
+                            _, sig2, conf2 = localizar_ui_xbox_dinamica(lin2)
+                            if conf2:
+                                clic_multimonitor(conf2[0], conf2[1])
+                                presionar_enter_nativo()
+                                print(f"   [✔ AUTO-CONFIRMAR] Botón 'CONFIRMAR' pulsado en {conf2}!")
+                                break
+                            target_sig = sig2 or ultimo_btn_siguiente
+                            if target_sig:
+                                clic_multimonitor(target_sig[0], target_sig[1])
+
+                        try:
+                            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                        except Exception:
+                            pass
+                        ultimo_raw_por_monitor.clear()
+                        break
+
+            time.sleep(0.003)
+
         except KeyboardInterrupt:
-            print("\n[⏹] Detenido.")
+            print("\n[⏹] Sniper detenido.")
             break
         except Exception:
-            time.sleep(0.02)
+            time.sleep(0.015)
 
 
 if __name__ == "__main__":
