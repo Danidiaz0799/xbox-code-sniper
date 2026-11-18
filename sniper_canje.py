@@ -86,6 +86,7 @@ KEYEVENTF_KEYUP = 0x0002
 VK_BACK = 0x08
 VK_RETURN = 0x0D
 VK_CONTROL = 0x11
+VK_ESCAPE = 0x1B
 VK_A = 0x41
 VK_V = 0x56
 
@@ -184,6 +185,26 @@ def enfocar_ventana_en_punto(x: int, y: int):
         pass
 
 
+def obtener_posicion_cursor() -> tuple[int, int]:
+    """Obtiene la posición actual (x, y) del cursor en el escritorio virtual."""
+    pt = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
+
+
+def restaurar_posicion_cursor(x: int, y: int):
+    """Devuelve el cursor al punto exacto donde lo tenía el usuario."""
+    try:
+        user32.SetCursorPos(int(x), int(y))
+    except Exception:
+        pass
+
+
+def usuario_presiono_esc() -> bool:
+    """Devuelve True si el usuario está presionando la tecla ESC para cancelar."""
+    return bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
+
+
 def clic_multimonitor(x: int, y: int) -> int:
     """
     Mueve el cursor y hace clic con precisión exacta en configuraciones de 1, 2 o 3 monitores
@@ -210,38 +231,56 @@ def clic_multimonitor(x: int, y: int) -> int:
     return _enviar_inputs(move, down, up)
 
 
+def clic_y_restaurar(x: int, y: int) -> int:
+    """Hace un clic preciso y devuelve de inmediato el cursor a donde estaba el usuario."""
+    pos_original = obtener_posicion_cursor()
+    try:
+        res = clic_multimonitor(x, y)
+        time.sleep(0.012)
+        return res
+    finally:
+        restaurar_posicion_cursor(pos_original[0], pos_original[1])
+
+
 def inyectar_codigo_en_xbox(coord, codigo_25: str) -> int:
     """
-    1. Copia los 25 caracteres al portapapeles de Windows en < 0.5 ms.
-    2. Activa la ventana destino (aunque esté en otro monitor) y hace doble clic rápido en la casilla.
-    3. Limpia cualquier texto residual (Ctrl+A + Backspace), pega de golpe (Ctrl+V) y presiona Enter.
+    1. Guarda la posición actual del cursor del usuario.
+    2. Copia los 25 caracteres al portapapeles de Windows en < 0.5 ms.
+    3. Activa la ventana destino (aunque esté en otro monitor) y hace doble clic rápido en la casilla.
+    4. Limpia cualquier texto residual (Ctrl+A + Backspace), pega de golpe (Ctrl+V) y presiona Enter.
+    5. Restaura inmediatamente el cursor a su posición original para no interrumpir al usuario.
     """
     if not coord:
         return 0
 
-    copiar_portapapeles_win32(codigo_25.upper())
-    enfocar_ventana_en_punto(coord[0], coord[1])
+    pos_original = obtener_posicion_cursor()
+    try:
+        copiar_portapapeles_win32(codigo_25.upper())
+        enfocar_ventana_en_punto(coord[0], coord[1])
 
-    clic_multimonitor(coord[0], coord[1])
-    time.sleep(0.018)
-    clic_multimonitor(coord[0], coord[1])
-    time.sleep(0.018)
+        clic_multimonitor(coord[0], coord[1])
+        time.sleep(0.018)
+        clic_multimonitor(coord[0], coord[1])
+        time.sleep(0.018)
 
-    enviados = _enviar_inputs(
-        _key_event(VK_CONTROL, False),
-        _key_event(VK_A, False),
-        _key_event(VK_A, True),
-        _key_event(VK_CONTROL, True),
-        _key_event(VK_BACK, False),
-        _key_event(VK_BACK, True),
-        _key_event(VK_CONTROL, False),
-        _key_event(VK_V, False),
-        _key_event(VK_V, True),
-        _key_event(VK_CONTROL, True),
-        _key_event(VK_RETURN, False),
-        _key_event(VK_RETURN, True),
-    )
-    return enviados
+        enviados = _enviar_inputs(
+            _key_event(VK_CONTROL, False),
+            _key_event(VK_A, False),
+            _key_event(VK_A, True),
+            _key_event(VK_CONTROL, True),
+            _key_event(VK_BACK, False),
+            _key_event(VK_BACK, True),
+            _key_event(VK_CONTROL, False),
+            _key_event(VK_V, False),
+            _key_event(VK_V, True),
+            _key_event(VK_CONTROL, True),
+            _key_event(VK_RETURN, False),
+            _key_event(VK_RETURN, True),
+        )
+        time.sleep(0.010)
+        return enviados
+    finally:
+        restaurar_posicion_cursor(pos_original[0], pos_original[1])
 
 
 def presionar_enter_nativo():
@@ -368,6 +407,35 @@ RE_ETIQUETA_ARRIBA_INPUT = re.compile(r"^se\s+agregar\S*\s+a\s+\S+@", re.IGNOREC
 RE_BOTON_SIGUIENTE = re.compile(r"^(siguiente|sibuien\S*|siguien\S*|next)$", re.IGNORECASE)
 RE_BOTON_CANCELAR = re.compile(r"^(cancelar|cancel)$", re.IGNORECASE)
 RE_BOTON_CONFIRMAR = re.compile(r"^(confirmar|confirm|canjear\s+ahora|redeem\s+now)$", re.IGNORECASE)
+RE_ERROR_XBOX = re.compile(
+    r"(comprueba\s+las\s+instrucciones|no\s+se\s+encontr|no\s+es\s+v[aá]lid|c[oó]digo\s+no\s+v[aá]lid|"
+    r"ya\s+se\s+canje|ya\s+ha\s+sido\s+canjead|ya\s+has\s+canjeado|"
+    r"check\s+the\s+instructions|not\s+found|isn['’]?t\s+valid|already\s+redeemed)",
+    re.IGNORECASE,
+)
+
+
+def es_codigo_procesado(c25: str, procesados: set[str]) -> bool:
+    """
+    Deduplicación difusa (distancia de Hamming <= 4):
+    Devuelve True si el código es idéntico o coincide en >= 21 de los 25 caracteres
+    con uno ya procesado, evitando re-disparos por parpadeos del OCR.
+    """
+    if c25 in procesados:
+        return True
+    for prev in procesados:
+        if len(prev) == len(c25) == 25:
+            if sum(1 for a, b in zip(c25, prev) if a == b) >= 21:
+                return True
+    return False
+
+
+def _dentro_de_casilla(cx: int, cy: int, casilla_coord, mon_w: int, mon_h: int) -> bool:
+    if not casilla_coord:
+        return False
+    tol_x = max(280, int(mon_w * 0.18))
+    tol_y = max(55, int(mon_h * 0.06))
+    return abs(cx - casilla_coord[0]) < tol_x and abs(cy - casilla_coord[1]) < tol_y
 
 
 def _validar_codigo_25(raw25: str, tiene_guiones: bool):
@@ -464,11 +532,8 @@ def detectar_codigos_en_lineas(lineas, casilla_xbox_coord=None, ocr=None, frame_
         mon_h = item.get("mon_h", 1080)
 
         # Ignorar el texto que ya está escrito dentro de la propia casilla de Xbox (proporcional a la resolución)
-        if casilla_xbox_coord:
-            tol_x = max(220, int(mon_w * 0.14))
-            tol_y = max(38, int(mon_h * 0.04))
-            if abs(cx - casilla_xbox_coord[0]) < tol_x and abs(cy - casilla_xbox_coord[1]) < tol_y:
-                continue
+        if _dentro_de_casilla(cx, cy, casilla_xbox_coord, mon_w, mon_h):
+            continue
 
         extraidos = _extraer_de_texto_linea(txt)
         necesita_zoom = (
@@ -559,9 +624,57 @@ def obtener_monitores_activos(sct, max_monitores: int = 3):
     return list(enumerate(todos, start=1))
 
 
+def confirmar_canje_sin_bloquear(ocr: FastWindowsOCR, sct, mon_xbox: dict, ultimo_btn_siguiente):
+    """
+    Observa el monitor de Xbox por OCR hasta 2.4s sin secuestrar el mouse del usuario:
+    - Aborta de inmediato si se presiona ESC o si Xbox muestra un mensaje de código inválido/usado.
+    - Pulsa 'SIGUIENTE' como máximo 1 sola vez (restaurando el cursor del usuario en < 15 ms).
+    - Pulsa 'CONFIRMAR' 1 sola vez en cuanto aparezca y termina.
+    """
+    t_inicio = time.perf_counter()
+    clic_siguiente_hecho = False
+
+    while (time.perf_counter() - t_inicio) < 2.4:
+        if usuario_presiono_esc():
+            print("   [⏹] Confirmación cancelada por el usuario (ESC).")
+            return
+
+        time.sleep(0.12)
+
+        if usuario_presiono_esc():
+            print("   [⏹] Confirmación cancelada por el usuario (ESC).")
+            return
+
+        try:
+            s2 = sct.grab(mon_xbox)
+            lin2 = ocr.recognize_monitor(
+                s2.raw, s2.width, s2.height, mon_xbox["left"], mon_xbox["top"]
+            )
+        except Exception:
+            continue
+
+        if any(RE_ERROR_XBOX.search(item["text"]) for item in lin2):
+            print("   [ℹ] Xbox indicó que el código no es válido o ya fue usado.")
+            return
+
+        _, sig2, conf2 = localizar_ui_xbox_dinamica(lin2)
+        if conf2:
+            clic_y_restaurar(conf2[0], conf2[1])
+            presionar_enter_nativo()
+            print(f"   [✔ AUTO-CONFIRMAR] Botón 'CONFIRMAR' pulsado en {conf2}!")
+            return
+
+        if not clic_siguiente_hecho and (time.perf_counter() - t_inicio) >= 0.35:
+            target_sig = sig2 or ultimo_btn_siguiente
+            if target_sig:
+                clic_y_restaurar(target_sig[0], target_sig[1])
+                print(f"   [🎯 AUTO-SIGUIENTE] Botón 'SIGUIENTE' pulsado 1 vez en {target_sig}.")
+            clic_siguiente_hecho = True
+
+
 def main():
     print("=" * 78)
-    print("  🚀 SNIPER XBOX PRO (MULTI-MONITOR 1-3 PANTALLAS | 720P A 4K | AUTO-ZOOM)")
+    print("  🚀 SNIPER XBOX PRO (MULTI-MONITOR 1-3 PANTALLAS | 720P A 4K | FLUJO LIBRE)")
     print("=" * 78)
 
     ocr = FastWindowsOCR(lang_tag="es")
@@ -575,7 +688,7 @@ def main():
     print(f"  • Monitores detectados ({num_monitores_prev}):")
     for idx, m in monitores:
         print(f"    - Monitor {idx}: {m['width']}x{m['height']} en (X={m['left']}, Y={m['top']})")
-    print("  • Puedes tener el video/WhatsApp en un monitor y Xbox en otro, o en pantalla dividida.")
+    print("  • El cursor vuelve siempre a tu posición al instante. Pulsa ESC para abortar un canje.")
     print("=" * 78)
 
     codigos_procesados = set()
@@ -583,8 +696,9 @@ def main():
     ultimo_btn_siguiente = None
     monitor_xbox_idx = 1
     ultimo_raw_por_monitor = {}
+    ultimo_aviso_sin_xbox = None
 
-    # Escaneo inicial en todos los monitores para localizar la ventana de Xbox e ignorar códigos viejos
+    # Escaneo inicial en todos los monitores para localizar la ventana de Xbox e ignorar código ya escrito en su casilla
     for idx, mon in monitores:
         try:
             s_init = sct.grab(mon)
@@ -595,6 +709,18 @@ def main():
                 ultimo_btn_siguiente = sig_i
                 monitor_xbox_idx = idx
                 print(f"[🎯 CASILLA XBOX LISTA EN MONITOR {idx}] Posición: {ultima_coord_xbox} | Siguiente: {ultimo_btn_siguiente}")
+                codigos_init = detectar_codigos_en_lineas(
+                    lin_init,
+                    casilla_xbox_coord=None,
+                    ocr=ocr,
+                    frame_bgra=s_init.raw,
+                    fw=s_init.width,
+                    fh=s_init.height,
+                )
+                for c25, cfmt, pos_c in codigos_init:
+                    if _dentro_de_casilla(pos_c[0], pos_c[1], inp_i, mon["width"], mon["height"]):
+                        codigos_procesados.add(c25)
+                        print(f"[i] Código ya presente dentro de la casilla de Xbox ignorado: {cfmt}")
         except Exception:
             pass
 
@@ -644,44 +770,47 @@ def main():
                     fw=s.width,
                     fh=s.height,
                 )
+                if not codigos:
+                    continue
 
-                for c25, cfmt, pos_codigo in reversed(codigos):
-                    if c25 not in codigos_procesados:
-                        if not ultima_coord_xbox:
-                            print(f"[!] Código {cfmt} visto en Monitor {idx} {pos_codigo}, pero no se ve la casilla de Xbox en ningún monitor.")
-                            continue
+                nuevos = [
+                    (c25, cfmt, pos)
+                    for c25, cfmt, pos in codigos
+                    if not es_codigo_procesado(c25, codigos_procesados)
+                ]
+                if not nuevos:
+                    continue
 
-                        codigos_procesados.add(c25)
-                        n_ev = inyectar_codigo_en_xbox(ultima_coord_xbox, c25)
-                        ms = (time.perf_counter() - t_frame) * 1000.0
-                        print(
-                            f"\n⚡ [MONITOR {idx} -> MONITOR {monitor_xbox_idx} EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}"
-                        )
+                c25, cfmt, pos_codigo = nuevos[-1]
+                if not ultima_coord_xbox:
+                    if ultimo_aviso_sin_xbox != c25:
+                        ultimo_aviso_sin_xbox = c25
+                        print(f"[!] Código {cfmt} visto en Monitor {idx} {pos_codigo}, pero no se ve la casilla de Xbox en ningún monitor.")
+                    continue
 
-                        # Fase rápida de confirmación escaneando únicamente el monitor donde está Xbox
-                        mon_xbox = dict(monitores).get(monitor_xbox_idx, mon)
-                        for _ in range(22):
-                            time.sleep(0.12)
-                            s2 = sct.grab(mon_xbox)
-                            lin2 = ocr.recognize_monitor(
-                                s2.raw, s2.width, s2.height, mon_xbox["left"], mon_xbox["top"]
-                            )
-                            _, sig2, conf2 = localizar_ui_xbox_dinamica(lin2)
-                            if conf2:
-                                clic_multimonitor(conf2[0], conf2[1])
-                                presionar_enter_nativo()
-                                print(f"   [✔ AUTO-CONFIRMAR] Botón 'CONFIRMAR' pulsado en {conf2}!")
-                                break
-                            target_sig = sig2 or ultimo_btn_siguiente
-                            if target_sig:
-                                clic_multimonitor(target_sig[0], target_sig[1])
+                if usuario_presiono_esc():
+                    continue
 
-                        try:
-                            winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                        except Exception:
-                            pass
-                        ultimo_raw_por_monitor.clear()
-                        break
+                # Registrar todos los códigos visibles en el frame actual para no disparar historial en cadena
+                for c_vis, _, _ in codigos:
+                    codigos_procesados.add(c_vis)
+
+                n_ev = inyectar_codigo_en_xbox(ultima_coord_xbox, c25)
+                ms = (time.perf_counter() - t_frame) * 1000.0
+                print(
+                    f"\n⚡ [MONITOR {idx} -> MONITOR {monitor_xbox_idx} EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}"
+                )
+
+                # Confirmación no-intrusiva (1 clic máx en Siguiente, 1 clic máx en Confirmar, sin atrapar el mouse)
+                mon_xbox = dict(monitores).get(monitor_xbox_idx, mon)
+                confirmar_canje_sin_bloquear(ocr, sct, mon_xbox, ultimo_btn_siguiente)
+
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                except Exception:
+                    pass
+                ultimo_raw_por_monitor.clear()
+                break
 
             time.sleep(0.003)
 
