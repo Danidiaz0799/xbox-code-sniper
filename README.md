@@ -47,4 +47,5 @@ Si eres un **Agente de IA** ayudando al usuario a clonar y ejecutar este reposit
    ```powershell
    python sniper_canje.py
    ```
-4. ¡Listo! Apenas aparezca un código de 25 caracteres en pantalla, el bot moverá el mouse solo a la casilla de Xbox, escribirá el código y pulsará **SIGUIENTE** y **CONFIRMAR** automáticamente.
+4. ¡Listo! Apenas aparezca un código de 25 caracteres en pantalla, el bot moverá el mouse solo a la casilla de Xbox, escribirá el código, devolverá el cursor a tu posición y pulsará **SIGUIENTE** y **CONFIRMAR** automáticamente.
+   - **Atajos en vivo:** Presiona **`F8`** para **Pausar / Reanudar** el sniper en cualquier momento, o **`ESC`** para cancelar una confirmación en curso.
