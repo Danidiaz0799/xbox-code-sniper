@@ -421,24 +421,18 @@ RE_BOTON_CONFIRMAR = re.compile(r"^(confirmar|confirm|canjear\s+ahora|redeem\s+n
 RE_ERROR_XBOX = re.compile(
     r"(comprueba\s+las\s+instrucciones|no\s+se\s+encontr|no\s+es\s+v[aá]lid|c[oó]digo\s+no\s+v[aá]lid|"
     r"ya\s+se\s+canje|ya\s+ha\s+sido\s+canjead|ya\s+has\s+canjeado|"
-    r"check\s+the\s+instructions|not\s+found|isn['’]?t\s+valid|already\s+redeemed)",
+    r"se\s+ha\s+\S*cido\s+un|error\s+inesperado|error\s+se\s+ha\s+registrado|vuelve\s+a\s+canjear|"
+    r"check\s+the\s+instructions|not\s+found|isn['’]?t\s+valid|already\s+redeemed|unexpected\s+error|try\s+again\s+later)",
     re.IGNORECASE,
 )
 
 
 def es_codigo_procesado(c25: str, procesados: set[str]) -> bool:
     """
-    Deduplicación difusa (distancia de Hamming <= 4):
-    Devuelve True si el código es idéntico o coincide en >= 21 de los 25 caracteres
-    con uno ya procesado, evitando re-disparos por parpadeos del OCR.
+    Comprobación exacta de códigos ya procesados para permitir validar códigos
+    consecutivos que difieran aunque sea en un solo carácter.
     """
-    if c25 in procesados:
-        return True
-    for prev in procesados:
-        if len(prev) == len(c25) == 25:
-            if sum(1 for a, b in zip(c25, prev) if a == b) >= 21:
-                return True
-    return False
+    return c25 in procesados
 
 
 def _dentro_de_casilla(cx: int, cy: int, casilla_coord, mon_w: int, mon_h: int) -> bool:
@@ -453,8 +447,12 @@ def _validar_codigo_25(raw25: str, tiene_guiones: bool):
     """
     Valida que los 25 caracteres correspondan a un código de 25 caracteres (formato 5x5):
     - Rechaza texto común, palabras, frases o placeholders ('XXXXXXXXXXXXXXXXXXXXXXXXX').
+    - Penaliza minúsculas dudosas del OCR para priorizar lecturas nítidas en mayúscula.
     - Devuelve (codigo_25, codigo_formateado_5x5, puntaje_alfabeto_xbox).
     """
+    if sum(1 for c in raw25 if c.isupper() or c.isdigit()) >= 18:
+        raw25 = raw25.replace("d", "4").replace("a", "4").replace("g", "9").replace("q", "9")
+    minusculas = sum(1 for c in raw25 if c.islower())
     raw25 = raw25.upper()
     if len(raw25) != 25 or not raw25.isalnum() or len(set(raw25)) <= 3:
         return None
@@ -474,19 +472,19 @@ def _validar_codigo_25(raw25: str, tiene_guiones: bool):
         bloques = [raw25[i : i + 5] for i in range(0, 25, 5)]
         bloques_con_digito = sum(1 for b in bloques if any(c.isdigit() for c in b))
         if bloques_con_digito >= 3:
-            return raw25, "-".join(bloques), valid_xbox_count
+            return raw25, "-".join(bloques), valid_xbox_count - minusculas
 
     # Si no tenía todos los guiones pero cumple el alfabeto sin vocales de Xbox
     if valid_xbox_count >= 21 and digit_count >= 3:
         corregido = raw25.translate(TABLA_CORRECCION_XBOX)
-        return corregido, "-".join(corregido[i : i + 5] for i in range(0, 25, 5)), 25
+        return corregido, "-".join(corregido[i : i + 5] for i in range(0, 25, 5)), 25 - minusculas
 
     return None
 
 
 def _extraer_de_texto_linea(txt: str):
-    txt = txt.upper()
-    if any(m in txt for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK", "@")):
+    txt_up = txt.upper()
+    if any(m in txt_up for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK", "@")):
         return []
 
     resultados = []
@@ -505,7 +503,7 @@ def _extraer_de_texto_linea(txt: str):
     if resultados:
         return resultados
 
-    palabras = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Z0-9]+", txt)]
+    palabras = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-z0-9]+", txt)]
     n = len(palabras)
     for i in range(n):
         if len(palabras[i][0]) % 5 != 0:
@@ -609,6 +607,23 @@ def localizar_ui_xbox_dinamica(lineas):
     linea_cancelar = None
 
     for item in lineas:
+        limpio = re.sub(r"[^A-Za-zÁÉÍÓÚáéíóúñÑ\s]", "", item["text"]).strip()
+        if not limpio or item["w"] > max(420, int(item.get("mon_w", 1920) * 0.25)) or item["h"] > 140:
+            continue
+        if RE_BOTON_CONFIRMAR.match(limpio):
+            coord_confirmar = (item["cx"], item["cy"])
+        elif RE_BOTON_SIGUIENTE.match(limpio):
+            coord_siguiente = (item["cx"], item["cy"])
+        elif RE_BOTON_CANCELAR.match(limpio):
+            linea_cancelar = item
+
+    if not coord_siguiente and linea_cancelar:
+        coord_siguiente = (
+            linea_cancelar["cx"] + int(linea_cancelar["w"] * 3.8),
+            linea_cancelar["cy"],
+        )
+
+    for item in lineas:
         if RE_PLACEHOLDER_INPUT.search(item["text"]):
             coord_input = (item["cx"], item["cy"])
             break
@@ -625,22 +640,26 @@ def localizar_ui_xbox_dinamica(lineas):
                 offset_x = max(80, int(item["w"] * 0.45))
                 coord_input = (item["x"] + offset_x, item["y"] + item["h"] + offset_y)
 
-    for item in lineas:
-        limpio = re.sub(r"[^A-Za-zÁÉÍÓÚáéíóúñÑ\s]", "", item["text"]).strip()
-        if not limpio or item["w"] > max(420, int(item.get("mon_w", 1920) * 0.25)) or item["h"] > 140:
-            continue
-        if RE_BOTON_CONFIRMAR.match(limpio):
-            coord_confirmar = (item["cx"], item["cy"])
-        elif RE_BOTON_SIGUIENTE.match(limpio):
-            coord_siguiente = (item["cx"], item["cy"])
-        elif RE_BOTON_CANCELAR.match(limpio):
-            linea_cancelar = item
+    # Respaldo A: código ya escrito dentro de la casilla encima del botón CANCELAR
+    if not coord_input and linea_cancelar:
+        tol_modal_x = max(180, int(linea_cancelar.get("mon_w", 1920) * 0.16))
+        for item in lineas:
+            if (
+                item["cy"] < linea_cancelar["cy"]
+                and abs(item["x"] - linea_cancelar["x"]) < tol_modal_x
+                and PATRON_XBOX_5X5.search(item["text"])
+            ):
+                coord_input = (item["cx"], item["cy"])
+                break
 
-    if not coord_siguiente and linea_cancelar:
-        coord_siguiente = (
-            linea_cancelar["cx"] + int(linea_cancelar["w"] * 3.8),
-            linea_cancelar["cy"],
-        )
+    # Respaldo B: casilla justo encima de un mensaje de error rojo de Xbox
+    if not coord_input:
+        for item in lineas:
+            if RE_ERROR_XBOX.search(item["text"]):
+                offset_x = max(80, int(item["w"] * 0.45))
+                offset_y = max(26, int(item["h"] * 3.0))
+                coord_input = (item["x"] + offset_x, max(15, item["y"] - offset_y))
+                break
 
     return coord_input, coord_siguiente, coord_confirmar
 
@@ -849,40 +868,41 @@ def main():
                 if not nuevos:
                     continue
 
-                c25, cfmt, pos_codigo = nuevos[-1]
                 if not ultima_coord_xbox:
-                    if ultimo_aviso_sin_xbox != c25:
-                        ultimo_aviso_sin_xbox = c25
-                        print(f"[!] Código {cfmt} visto en Monitor {idx} {pos_codigo}, pero no se ve la casilla de Xbox en ningún monitor.")
+                    if ultimo_aviso_sin_xbox != nuevos[0][0]:
+                        ultimo_aviso_sin_xbox = nuevos[0][0]
+                        print(f"[!] Código {nuevos[0][1]} visto en Monitor {idx} {nuevos[0][2]}, pero no se ve la casilla de Xbox en ningún monitor.")
                     continue
 
-                if usuario_presiono_esc():
-                    continue
-
-                if usuario_usando_mouse():
-                    ultimo_raw_por_monitor.pop(idx, None)
-                    continue
-
-                # Registrar todos los códigos visibles en el frame actual para no disparar historial en cadena
-                for c_vis, _, _ in codigos:
-                    codigos_procesados.add(c_vis)
-
-                n_ev = inyectar_codigo_en_xbox(ultima_coord_xbox, c25)
-                ms = (time.perf_counter() - t_frame) * 1000.0
-                print(
-                    f"\n⚡ [MONITOR {idx} -> MONITOR {monitor_xbox_idx} EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}"
-                )
-
-                # Confirmación no-intrusiva enfocada en el ROI de Xbox
+                # Validar secuencialmente todos los códigos nuevos detectados en pantalla
                 mon_xbox = dict(monitores).get(monitor_xbox_idx, mon)
-                confirmar_canje_sin_bloquear(
-                    ocr, sct, mon_xbox, ultima_coord_xbox, ultimo_btn_siguiente
-                )
+                total_nuevos = len(nuevos)
+                for idx_cod, (c25, cfmt, pos_codigo) in enumerate(nuevos):
+                    if usuario_presiono_esc() or not ultima_coord_xbox:
+                        break
+                    if usuario_usando_mouse():
+                        ultimo_raw_por_monitor.pop(idx, None)
+                        break
 
-                try:
-                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                except Exception:
-                    pass
+                    codigos_procesados.add(c25)
+                    n_ev = inyectar_codigo_en_xbox(ultima_coord_xbox, c25)
+                    ms = (time.perf_counter() - t_frame) * 1000.0
+                    print(
+                        f"\n⚡ [{idx_cod + 1}/{total_nuevos}] [MONITOR {idx} -> MONITOR {monitor_xbox_idx} EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}"
+                    )
+
+                    confirmar_canje_sin_bloquear(
+                        ocr, sct, mon_xbox, ultima_coord_xbox, ultimo_btn_siguiente
+                    )
+
+                    try:
+                        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                    except Exception:
+                        pass
+
+                    if idx_cod + 1 < total_nuevos:
+                        time.sleep(0.20)
+
                 ultimo_raw_por_monitor.clear()
                 break
 
