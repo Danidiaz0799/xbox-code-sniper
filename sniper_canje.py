@@ -12,15 +12,19 @@ import winsound
 try:
     import mss
     import mss.windows.gdi as mss_gdi
+    from PIL import Image
+    import pyperclip
     from winrt.windows.globalization import Language
     from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.media.ocr import OcrEngine
     from winrt.windows.storage.streams import DataWriter
 except ImportError:
     print("[⚙] Instalando librerías necesarias por única vez...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "mss", "winocr"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "mss", "pillow", "pyperclip", "winocr"])
     import mss
     import mss.windows.gdi as mss_gdi
+    from PIL import Image
+    import pyperclip
     from winrt.windows.globalization import Language
     from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.media.ocr import OcrEngine
@@ -42,7 +46,7 @@ except Exception:
         pass
 
 # ==============================================================================
-# 1. CLIC Y TECLEO DIRECTO POR HARDWARE WIN32 (Sin usar portapapeles, < 1 ms)
+# 1. CLIC Y PEGADO NATIVO WIN32 (< 1 ms)
 # ==============================================================================
 user32 = ctypes.windll.user32
 
@@ -58,6 +62,7 @@ VK_BACK = 0x08
 VK_RETURN = 0x0D
 VK_CONTROL = 0x11
 VK_A = 0x41
+VK_V = 0x56
 
 ULONG_PTR = wintypes.WPARAM
 
@@ -140,32 +145,31 @@ def escribir_codigo_directo(coord, codigo_25: str) -> int:
     if not coord:
         return 0
 
-    clic_nativo(coord[0], coord[1])
-    time.sleep(0.020)
-    clic_nativo(coord[0], coord[1])
-    time.sleep(0.020)
+    try:
+        pyperclip.copy(codigo_25.upper())
+    except Exception:
+        pass
 
-    # Limpiar texto anterior (Ctrl+A + Backspace)
-    _enviar_inputs(
+    clic_nativo(coord[0], coord[1])
+    time.sleep(0.025)
+    clic_nativo(coord[0], coord[1])
+    time.sleep(0.025)
+
+    # Seleccionar todo (Ctrl+A), borrar (Backspace), pegar de golpe (Ctrl+V) y presionar Enter
+    enviados = _enviar_inputs(
         _key_event(VK_CONTROL, False),
         _key_event(VK_A, False),
         _key_event(VK_A, True),
         _key_event(VK_CONTROL, True),
         _key_event(VK_BACK, False),
         _key_event(VK_BACK, True),
+        _key_event(VK_CONTROL, False),
+        _key_event(VK_V, False),
+        _key_event(VK_V, True),
+        _key_event(VK_CONTROL, True),
+        _key_event(VK_RETURN, False),
+        _key_event(VK_RETURN, True),
     )
-    time.sleep(0.008)
-
-    # Escribir los 25 caracteres directamente por hardware
-    enviados = 0
-    for ch in codigo_25.upper():
-        if ch.isalnum():
-            vk = ord(ch)
-            enviados += _enviar_inputs(_key_event(vk, False), _key_event(vk, True))
-            time.sleep(0.002)
-
-    time.sleep(0.015)
-    enviados += _enviar_inputs(_key_event(VK_RETURN, False), _key_event(VK_RETURN, True))
     return enviados
 
 
@@ -174,7 +178,7 @@ def presionar_enter_nativo():
 
 
 # ==============================================================================
-# 2. MOTOR OCR NATIVO DE WINDOWS CON COORDENADAS EN TIEMPO REAL
+# 2. MOTOR OCR NATIVO DE WINDOWS CON COORDENADAS Y AUTO-ZOOM 2X EN LÍNEAS
 # ==============================================================================
 class FastWindowsOCR:
     def __init__(self, lang_tag: str = "es"):
@@ -199,6 +203,10 @@ class FastWindowsOCR:
         )
         return await self.engine.recognize_async(sb)
 
+    def recognize_text(self, bgra_bytes: bytes, width: int, height: int) -> str:
+        res = self.loop.run_until_complete(self._recognize_async(bgra_bytes, width, height))
+        return res.text.strip() if res and res.text else ""
+
     def recognize_with_boxes(self, bgra_bytes: bytes, width: int, height: int, offset_x: int = 0, offset_y: int = 0):
         res = self.loop.run_until_complete(self._recognize_async(bgra_bytes, width, height))
         if not res:
@@ -218,6 +226,8 @@ class FastWindowsOCR:
                 "cy": int(offset_y + (y0 + y1) / 2),
                 "x": int(offset_x + x0),
                 "y": int(offset_y + y0),
+                "rx": int(x0),
+                "ry": int(y0),
                 "w": int(x1 - x0),
                 "h": int(y1 - y0),
             })
@@ -225,7 +235,7 @@ class FastWindowsOCR:
 
 
 # ==============================================================================
-# 3. INTELIGENCIA DE CÓDIGOS XBOX + DETECCIÓN DINÁMICA DE CASILLA Y BOTONES
+# 3. INTELIGENCIA DE CÓDIGOS XBOX + AUTO-ZOOM 2X EN BURBUJAS DE CHAT/VIDEO
 # ==============================================================================
 XBOX_VALID_CHARS = set("BCDFGHJKMPQRTVWXYZ2346789")
 TABLA_CORRECCION_XBOX = str.maketrans({
@@ -233,8 +243,15 @@ TABLA_CORRECCION_XBOX = str.maketrans({
     "5": "6", "S": "9", "A": "4", "E": "F", "U": "V", "N": "M",
 })
 
+# Soporta códigos 5x5 incluso si el borde de la burbuja de WhatsApp pegó 1 carácter extra al inicio/final
 PATRON_XBOX_5X5 = re.compile(
-    r"(?<![A-Z0-9])([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})(?![A-Z0-9])",
+    r"([A-Z0-9]{5,6})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5})[\s\-–—._•:;|/\\]+([A-Z0-9]{5,6})",
+    re.IGNORECASE,
+)
+
+# Detecta si una línea parece un código parcial (ej. '*9P4X-7M2W8-R5X9Y-H3Q6V-J8N26') para hacerle Zoom 2x
+PATRON_SOSPECHA_CODIGO = re.compile(
+    r"[A-Z0-9*#]{3,6}[\s\-–—._]+[A-Z0-9]{5}[\s\-–—._]+[A-Z0-9]{5}",
     re.IGNORECASE,
 )
 
@@ -264,53 +281,87 @@ def _validar_codigo_25(raw25: str, tiene_guiones: bool):
     return None
 
 
-def detectar_codigos_en_lineas(lineas, casilla_xbox_coord=None):
+def _extraer_de_texto_linea(txt: str):
+    txt = txt.upper()
+    if any(m in txt for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK")):
+        return []
+
+    resultados = []
+    for m in PATRON_XBOX_5X5.finditer(txt):
+        g1, g2, g3, g4, g5 = m.groups()
+        # Si el primer o último bloque tiene 6 caracteres por un borde de burbuja ('OK9P4X'), recortar a 5
+        if len(g1) == 6:
+            g1 = g1[-5:]
+        if len(g5) == 6:
+            g5 = g5[:5]
+        raw25 = g1 + g2 + g3 + g4 + g5
+        tiene_guion = any(c in txt[m.start() : m.end()] for c in "-–—._")
+        res = _validar_codigo_25(raw25, tiene_guiones=tiene_guion)
+        if res:
+            resultados.append(res)
+
+    if resultados:
+        return resultados
+
+    palabras = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Z0-9]+", txt)]
+    n = len(palabras)
+    for i in range(n):
+        if len(palabras[i][0]) % 5 != 0:
+            continue
+        acum = ""
+        tiene_guion = False
+        for j in range(i, min(i + 5, n)):
+            if len(palabras[j][0]) % 5 != 0:
+                break
+            if j > i:
+                sep = txt[palabras[j - 1][2] : palabras[j][1]]
+                if len(sep) > 4 or any(c.isalnum() for c in sep):
+                    break
+                if any(c in sep for c in "-–—._"):
+                    tiene_guion = True
+            acum += palabras[j][0]
+            if len(acum) == 25:
+                res = _validar_codigo_25(acum, tiene_guiones=tiene_guion)
+                if res:
+                    resultados.append(res)
+                break
+            elif len(acum) > 25:
+                break
+
+    return resultados
+
+
+def detectar_codigos_en_lineas(lineas, casilla_xbox_coord=None, ocr=None, frame_bgra=None, fw=0, fh=0):
     encontrados = []
     vistos = set()
 
     for item in lineas:
-        txt = item["text"].upper()
+        txt = item["text"]
         cx, cy = item["cx"], item["cy"]
-
-        if any(m in txt for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK")):
-            continue
 
         if casilla_xbox_coord and abs(cx - casilla_xbox_coord[0]) < 240 and abs(cy - casilla_xbox_coord[1]) < 42:
             continue
 
-        for m in PATRON_XBOX_5X5.finditer(txt):
-            raw25 = "".join(m.groups())
-            tiene_guion = any(c in txt[m.start() : m.end()] for c in "-–—._")
-            res = _validar_codigo_25(raw25, tiene_guiones=tiene_guion)
-            if res and res[0] not in vistos:
-                vistos.add(res[0])
-                encontrados.append((res[0], res[1], (cx, cy)))
+        extraidos = _extraer_de_texto_linea(txt)
 
-        palabras = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Z0-9]+", txt)]
-        n = len(palabras)
-        for i in range(n):
-            if len(palabras[i][0]) % 5 != 0:
-                continue
-            acum = ""
-            tiene_guion = False
-            for j in range(i, min(i + 5, n)):
-                if len(palabras[j][0]) % 5 != 0:
-                    break
-                if j > i:
-                    sep = txt[palabras[j - 1][2] : palabras[j][1]]
-                    if len(sep) > 4 or any(c.isalnum() for c in sep):
-                        break
-                    if any(c in sep for c in "-–—._"):
-                        tiene_guion = True
-                acum += palabras[j][0]
-                if len(acum) == 25:
-                    res = _validar_codigo_25(acum, tiene_guiones=tiene_guion)
-                    if res and res[0] not in vistos:
-                        vistos.add(res[0])
-                        encontrados.append((res[0], res[1], (cx, cy)))
-                    break
-                elif len(acum) > 25:
-                    break
+        # Si la línea parece un código pero a 1x el OCR falló en 1 letra (ej: '*9P4X-7M2W8-...'),
+        # hacemos un recorte + Zoom 2x BICUBIC instantáneo (~1.5 ms) sobre esa línea
+        if not extraidos and ocr and frame_bgra and PATRON_SOSPECHA_CODIGO.search(txt):
+            rx = max(0, item.get("rx", item["x"]) - 10)
+            ry = max(0, item.get("ry", item["y"]) - 8)
+            rw = min(fw - rx, item["w"] + 20)
+            rh = min(fh - ry, item["h"] + 16)
+            if rw > 20 and rh > 8:
+                img_full = Image.frombytes("RGBA", (fw, fh), frame_bgra)
+                crop = img_full.crop((rx, ry, rx + rw, ry + rh))
+                crop2x = crop.resize((rw * 2, rh * 2), Image.Resampling.BICUBIC)
+                txt_zoom = ocr.recognize_text(crop2x.tobytes(), rw * 2, rh * 2)
+                extraidos = _extraer_de_texto_linea(txt_zoom)
+
+        for c25, cfmt in extraidos:
+            if c25 not in vistos:
+                vistos.add(c25)
+                encontrados.append((c25, cfmt, (cx, cy)))
 
     return encontrados
 
@@ -356,7 +407,7 @@ def localizar_ui_xbox_dinamica(lineas):
 # ==============================================================================
 def main():
     print("=" * 72)
-    print("  🚀 SNIPER XBOX 100% DINÁMICO (ARCHIVO ÚNICO - CERO CALIBRACIÓN)")
+    print("  🚀 SNIPER XBOX 100% DINÁMICO (ARCHIVO ÚNICO - AUTO-ZOOM 2X)")
     print("=" * 72)
     print("  1. Pon en pantalla dividida el directo/WhatsApp y xbox.com/redeem.")
     print("  2. El bot localiza solo la casilla de Xbox y escribe el código al instante.")
@@ -395,7 +446,14 @@ def main():
             if dyn_sig:
                 ultimo_btn_siguiente = dyn_sig
 
-            codigos = detectar_codigos_en_lineas(lineas, casilla_xbox_coord=ultima_coord_xbox)
+            codigos = detectar_codigos_en_lineas(
+                lineas,
+                casilla_xbox_coord=ultima_coord_xbox,
+                ocr=ocr,
+                frame_bgra=s.raw,
+                fw=s.width,
+                fh=s.height,
+            )
             for c25, cfmt, pos_codigo in reversed(codigos):
                 if c25 not in codigos_procesados and ultima_coord_xbox:
                     codigos_procesados.add(c25)
